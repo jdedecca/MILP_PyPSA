@@ -1,0 +1,5 @@
+name,bus0,bus1,capital_cost,p_max_pu,p_min_pu,p_nom,p_nom_extendable,p_nom_min,branch_type,base_branch,p_nom_max
+Norwich Converter,Norwich,Norwich DC,0.21,0.9,-0.9,0,TRUE,0,converter,Norwich_Norwich DC,10000
+Norway Converter,Norway,Norway DC,0.2,0.9,-0.9,0,TRUE,0,converter,Norway_Norway DC,10000
+Bremen Converter,Bremen,Bremen DC,0.19,0.9,-0.9,0,TRUE,0,converter,Bremen_Bremen DC,10000
+DC link,London,Bremen,0.8765342,0.9,-0.9,0,TRUE,0,ptp,London_Bremen,10000
