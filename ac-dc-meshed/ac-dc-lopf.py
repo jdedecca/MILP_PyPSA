@@ -14,10 +14,6 @@ import numpy as np
 
 from itertools import chain
 
-pd.set_option("max_rows", 50)
-pd.set_option("max_columns", 70)
-pd.set_option('display.width', 200)
-
 network = pypsa.Network()
 
 folder_name = "ac-dc-data"
@@ -26,7 +22,7 @@ network.import_from_csv_folder(folder_name)
 now = network.snapshots[4]
 network.now = now
 parameters = {'discount_rate':0.00,'lifetime':1}
-network.lopf(network.snapshots,milp=True,parameters = parameters,solver_name='cplex')
+network.lopf(network.snapshots,milp=True,parameters = parameters)
 
 for sn in network.sub_networks.obj:
     print(sn,network.sub_networks.at[sn.name,"carrier"],len(sn.buses()),len(sn.branches()))
