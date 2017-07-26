@@ -1,4 +1,4 @@
-## Copyright 2016 Tom Brown (FIAS)
+## Copyright 2016-2017 Tom Brown (FIAS)
 
 ## This program is free software; you can redistribute it and/or
 ## modify it under the terms of the GNU General Public License as
@@ -22,7 +22,7 @@ from __future__ import division, absolute_import
 
 
 __author__ = "Tom Brown (FIAS)"
-__copyright__ = "Copyright 2016 Tom Brown (FIAS), GNU GPL 3"
+__copyright__ = "Copyright 2016-2017 Tom Brown (FIAS), GNU GPL 3"
 
 
 from scipy.sparse import issparse, csr_matrix, csc_matrix, hstack as shstack, vstack as svstack
@@ -37,7 +37,7 @@ import pandas as pd
 
 import collections
 
-from .pf import calculate_PTDF
+from .pf import calculate_PTDF, _as_snapshots
 
 from .opt import l_constraint
 
@@ -90,14 +90,11 @@ def network_lpf_contingency(network, snapshots=None, branch_outages=None):
     ----------
     snapshots : list-like|single snapshot
         A subset or an elements of network.snapshots on which to run
-        the power flow, defaults to [now]
+        the power flow, defaults to network.snapshots
         NB: currently this only works for a single snapshot
     branch_outages : list-like
         A list of passive branches which are to be tested for outages.
         If None, it's take as all network.passive_branches_i()
-    now : object
-        Deprecated: A member of network.snapshots on which to run the
-        power flow, defaults to network.now
 
     Returns
     -------
@@ -109,8 +106,9 @@ def network_lpf_contingency(network, snapshots=None, branch_outages=None):
     from .components import passive_branch_components
 
     if snapshots is None:
-        snapshot = network.now
-    elif isinstance(snapshots, collections.Iterable):
+        snapshots = network.snapshots
+
+    if isinstance(snapshots, collections.Iterable):
         logger.warning("Apologies LPF contingency, this only works for single snapshots at the moment, taking the first snapshot.")
         snapshot = snapshots[0]
     else:
@@ -167,7 +165,7 @@ def network_sclopf(network,snapshots=None,branch_outages=None,solver_name="glpk"
     Parameters
     ----------
     snapshots : list or index slice
-        A list of snapshots to optimise, must be a subset of network.snapshots, defaults to network.now
+        A list of snapshots to optimise, must be a subset of network.snapshots, defaults to network.snapshots
     branch_outages : list-like
         A list of passive branches which are to be tested for outages.
         If None, it's take as all network.passive_branches_i()
@@ -193,8 +191,7 @@ def network_sclopf(network,snapshots=None,branch_outages=None,solver_name="glpk"
     if not skip_pre:
         network.determine_network_topology()
 
-    if snapshots is None:
-        snapshots = [network.now]
+    snapshots = _as_snapshots(network, snapshots)
 
     passive_branches = network.passive_branches()
 
@@ -226,18 +223,18 @@ def network_sclopf(network,snapshots=None,branch_outages=None,solver_name="glpk"
                 logger.warning("No type given for {}, assuming it is a line".format(branch))
                 branch = ("Line",branch)
 
-            sub = network.sub_networks.obj[passive_branches.sub_network[branch]]
+            sub = network.sub_networks.at[passive_branches.at[branch,"sub_network"],"obj"]
 
             branch_i = sub._branches.at[branch,"_i"]
 
             branch_outage_keys.extend([(branch[0],branch[1],b[0],b[1]) for b in sub._branches.index])
 
-            flow_upper.update({(branch[0],branch[1],b[0],b[1],sn) : [[(1,network.model.passive_branch_p[b[0],b[1],sn]),(sub.BODF[sub._branches.at[b,"_i"],branch_i],network.model.passive_branch_p[branch[0],branch[1],sn])],"<=",sub._fixed_branches.s_nom[b]] for b in sub._fixed_branches.index for sn in snapshots})
+            flow_upper.update({(branch[0],branch[1],b[0],b[1],sn) : [[(1,network.model.passive_branch_p[b[0],b[1],sn]),(sub.BODF[sub._branches.at[b,"_i"],branch_i],network.model.passive_branch_p[branch[0],branch[1],sn])],"<=",sub._fixed_branches.at[b,"s_nom"]] for b in sub._fixed_branches.index for sn in snapshots})
 
             flow_upper.update({(branch[0],branch[1],b[0],b[1],sn) : [[(1,network.model.passive_branch_p[b[0],b[1],sn]),(sub.BODF[sub._branches.at[b,"_i"],branch_i],network.model.passive_branch_p[branch[0],branch[1],sn]),(-1,network.model.passive_branch_s_nom[b[0],b[1]])],"<=",0] for b in sub._extendable_branches.index for sn in snapshots})
 
 
-            flow_lower.update({(branch[0],branch[1],b[0],b[1],sn) : [[(1,network.model.passive_branch_p[b[0],b[1],sn]),(sub.BODF[sub._branches.at[b,"_i"],branch_i],network.model.passive_branch_p[branch[0],branch[1],sn])],">=",-sub._fixed_branches.s_nom[b]] for b in sub._fixed_branches.index for sn in snapshots})
+            flow_lower.update({(branch[0],branch[1],b[0],b[1],sn) : [[(1,network.model.passive_branch_p[b[0],b[1],sn]),(sub.BODF[sub._branches.at[b,"_i"],branch_i],network.model.passive_branch_p[branch[0],branch[1],sn])],">=",-sub._fixed_branches.at[b,"s_nom"]] for b in sub._fixed_branches.index for sn in snapshots})
 
             flow_upper.update({(branch[0],branch[1],b[0],b[1],sn) : [[(1,network.model.passive_branch_p[b[0],b[1],sn]),(sub.BODF[sub._branches.at[b,"_i"],branch_i],network.model.passive_branch_p[branch[0],branch[1],sn]),(1,network.model.passive_branch_s_nom[b[0],b[1]])],">=",0] for b in sub._extendable_branches.index for sn in snapshots})
 

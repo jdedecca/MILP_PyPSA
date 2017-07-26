@@ -1,6 +1,6 @@
 
 
-## Copyright 2015-2016 Tom Brown (FIAS), Jonas Hoersch (FIAS)
+## Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS)
 
 ## This program is free software; you can redistribute it and/or
 ## modify it under the terms of the GNU General Public License as
@@ -16,10 +16,17 @@
 ## along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 """
-Tools to override slow Pyomo problem building.
+Tools for fast Pyomo linear problem building.
 
 Essentially this library replaces Pyomo expressions with more strict
-objects with a pre-defined structure, to avoid Pyomo having to think.
+objects with a pre-defined affine structure.
+
+This code is also available as a gist
+
+https://gist.github.com/nworbmot/db3d446fa3b5c388519390e46fd5d8c3
+
+under a more permissive Apache 2.0 licence to allow sharing with other
+projects.
 
 """
 
@@ -42,7 +49,7 @@ import pandas as pd
 import gc, os, tempfile
 
 __author__ = "Tom Brown (FIAS), Jonas Hoersch (FIAS)"
-__copyright__ = "Copyright 2015-2016 Tom Brown (FIAS), Jonas Hoersch (FIAS), GNU GPL 3"
+__copyright__ = "Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS), GNU GPL 3"
 
 
 class LExpression(object):

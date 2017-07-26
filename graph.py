@@ -1,4 +1,4 @@
-## Copyright 2015-2016 Tom Brown (FIAS), Jonas Hoersch (FIAS)
+## Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS)
 
 ## This program is free software; you can redistribute it and/or
 ## modify it under the terms of the GNU General Public License as
@@ -52,44 +52,21 @@ def graph(network, branch_components=None):
 
     return graph
 
-def weighed_graph(network, branch_types=None):
-    """Build networkx graph."""
-    from . import components
-
-    if isinstance(network, components.Network):
-        if branch_types is None:
-            branch_components = components.branch_components
-        buses_i = network.buses.index
-    elif isinstance(network, components.SubNetwork):
-        if branch_types is None:
-            branch_components = components.passive_branch_components
-        buses_i = network.buses_i()
-    else:
-        raise TypeError("build_graph must be called with a Network or a SubNetwork")
-
-    graph = OrderedGraph()
-
-    # add nodes first, in case there are isolated buses not connected with branches
-    graph.add_nodes_from(buses_i)
-
-    # Multigraph uses object itself as key
-
-    graph.add_edges_from((branch.bus0, branch.bus1, (c.name, branch.Index), {'weight' : branch.length}) for c in network.iterate_components(branch_components) for branch in c.df.loc[slice(None) if c.ind is None else c.ind].itertuples())
-
-    return graph
-
-def adjacency_matrix(network, branch_components=None, busorder=None):
+def adjacency_matrix(network, branch_components=None, busorder=None, weights=None):
     """
     Construct a sparse adjacency matrix (directed)
 
     Parameters
     ----------
-    branch_componentss : iterable sublist of `branch_components`
+    branch_components : iterable sublist of `branch_components`
        Buses connected by any of the selected branches are adjacent
        (default: branch_components (network) or passive_branch_components (sub_network))
     busorder : pd.Index subset of network.buses.index
        Basis to use for the matrix representation of the adjacency matrix
        (default: buses.index (network) or buses_i() (sub_network))
+    weights : pd.Series or None (default)
+       If given must provide a weight for each branch, multi-indexed
+       on branch_component name and branch name.
 
     Returns
     -------
@@ -115,23 +92,28 @@ def adjacency_matrix(network, branch_components=None, busorder=None):
     no_branches = 0
     bus0_inds = []
     bus1_inds = []
+    weight_vals = []
     for c in network.iterate_components(branch_components):
         if c.ind is None:
             sel = slice(None)
-            no_branches += len(c.df)
+            no_branches = len(c.df)
         else:
-            sel = c.ind
-            no_branches += len(c.ind)
+            sel = t.ind
+            no_branches = len(c.ind)
         bus0_inds.append(busorder.get_indexer(c.df.loc[sel, "bus0"]))
         bus1_inds.append(busorder.get_indexer(c.df.loc[sel, "bus1"]))
+        weight_vals.append(np.ones(no_branches)
+                           if weights is None
+                           else weights[c.name][sel].values)
 
     if no_branches == 0:
         return sp.sparse.coo_matrix((no_buses, no_buses))
 
     bus0_inds = np.concatenate(bus0_inds)
     bus1_inds = np.concatenate(bus1_inds)
+    weight_vals = np.concatenate(weight_vals)
 
-    return sp.sparse.coo_matrix((np.ones(no_branches), (bus0_inds, bus1_inds)),
+    return sp.sparse.coo_matrix((weight_vals, (bus0_inds, bus1_inds)),
                                 shape=(no_buses, no_buses))
 
 def incidence_matrix(network, branch_components=None, busorder=None):

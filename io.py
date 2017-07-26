@@ -1,4 +1,5 @@
-## Copyright 2015-2016 Tom Brown (FIAS), Jonas Hoersch (FIAS)
+## Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS)
+## Copyright 2017 João Gorenstein Dedecca
 
 ## This program is free software; you can redistribute it and/or
 ## modify it under the terms of the GNU General Public License as
@@ -23,8 +24,15 @@ from six import iteritems
 from six.moves import filter, range
 
 
-__author__ = "Tom Brown (FIAS), Jonas Hoersch (FIAS)"
-__copyright__ = "Copyright 2015-2016 Tom Brown (FIAS), Jonas Hoersch (FIAS), GNU GPL 3"
+__author__ = """
+Tom Brown (FIAS), Jonas Hoersch (FIAS), David Schlachtberger (FIAS)
+Joao Gorenstein Dedecca
+"""
+
+__copyright__ = """
+Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS), David Schlachtberger (FIAS), GNU GPL 3
+Copyright 2017 João Gorenstein Dedecca, GNU GPL 3
+"""
 
 import logging
 logger = logging.getLogger(__name__)
@@ -34,7 +42,7 @@ import pandas as pd
 
 import os
 
-import pypsa_new as pypsa
+import pypsa
 
 import numpy as np
 
@@ -123,7 +131,9 @@ def export_to_csv_folder(network, csv_folder_name, encoding=None, export_standar
                 continue
             if col in attrs.index and pd.isnull(attrs.at[col,"default"]) and pd.isnull(df[col]).all():
                 continue
-            if col in attrs.index and (df[col] == attrs.at[col,"default"]).all():
+            if (col in attrs.index
+                and df[col].dtype == attrs.at[col, 'typ']
+                and (df[col] == attrs.at[col,"default"]).all()):
                 continue
 
             col_export.append(col)
@@ -217,9 +227,10 @@ def import_components_from_dataframe(network,dataframe,cls_name):
     #check all the buses are well-defined
     for attr in ["bus","bus0","bus1"]:
         if attr in new_df.columns:
-            missing = new_df.index[pd.isnull(new_df[attr].map(network.buses.v_nom))]
+            missing = new_df.index[~new_df[attr].isin(network.buses.index)]
             if len(missing) > 0:
-                logger.warning("The following {} have buses which are not defined:\n{}".format(cls_name,missing))
+                logger.warning("The following %s have buses which are not defined:\n%s",
+                               cls_name, missing)
 
 
     #now deal with time-dependent properties
@@ -316,7 +327,7 @@ def import_from_csv_folder(network, csv_folder_name, encoding=None):
     file_name = os.path.join(csv_folder_name,"snapshots.csv")
 
     if os.path.isfile(file_name):
-        df = pd.read_csv(file_name,index_col=0,encoding=encoding)
+        df = pd.read_csv(file_name, index_col=0, encoding=encoding, parse_dates=True)
         network.set_snapshots(df.index)
         if "weightings" in df.columns:
             network.snapshot_weightings = df["weightings"].reindex(network.snapshots)
@@ -345,7 +356,7 @@ def import_from_csv_folder(network, csv_folder_name, encoding=None):
         file_attrs = [n for n in os.listdir(csv_folder_name) if n.startswith(list_name+"-") and n.endswith(".csv")]
 
         for file_name in file_attrs:
-            df = pd.read_csv(os.path.join(csv_folder_name,file_name),index_col=0,encoding=encoding)
+            df = pd.read_csv(os.path.join(csv_folder_name,file_name), index_col=0, encoding=encoding, parse_dates=True)
             import_series_from_dataframe(network,df,component,file_name[len(list_name)+1:-4])
 
         logger.debug(getattr(network,list_name))
@@ -507,3 +518,95 @@ def import_from_pypower_ppc(network, ppc, overwrite_zero_s_nom=None):
 
     #for consistency with pypower, take the v_mag set point from the generators
     network.buses.loc[network.generators.bus,"v_mag_pu_set"] = np.asarray(network.generators["v_set_pu"])
+
+
+
+
+def import_from_pandapower_net(network, net):
+    """
+    Import network from pandapower net.
+
+    This import function is not yet finished (see warning below).
+
+    Parameters
+    ----------
+    net : pandapower network
+
+    Examples
+    --------
+    >>> network.import_from_pandapower_net(net)
+    """
+    logger.warning("Warning: Importing from pandapower is still in beta; not all pandapower data is supported.\nUnsupported features include: three-winding transformers, switches, in_service status, shunt impedances and tap positions of transformers.")
+
+    d = {}
+
+    d["Bus"] = pd.DataFrame({"v_nom" : net.bus.vn_kv.values,
+                             "v_mag_pu_set" : 1.},
+                            index=net.bus.name)
+
+    d["Load"] = pd.DataFrame({"p_set" : (net.load.scaling*net.load.p_kw).values/1e3,
+                              "q_set" : (net.load.scaling*net.load.q_kvar).values/1e3,
+                              "bus" : net.bus.name.loc[net.load.bus].values},
+                             index=net.load.name)
+
+    #deal with PV generators
+    d["Generator"] = pd.DataFrame({"p_set" : -(net.gen.scaling*net.gen.p_kw).values/1e3,
+                                   "q_set" : 0.,
+                                   "bus" : net.bus.name.loc[net.gen.bus].values,
+                                   "control" : "PV"},
+                                  index=net.gen.name)
+
+    d["Bus"].loc[net.bus.name.loc[net.gen.bus].values,"v_mag_pu_set"] = net.gen.vm_pu.values
+
+
+    #deal with PQ "static" generators
+    d["Generator"] = pd.concat((d["Generator"],pd.DataFrame({"p_set" : -(net.sgen.scaling*net.sgen.p_kw).values/1e3,
+                                                             "q_set" : -(net.sgen.scaling*net.sgen.q_kvar).values/1e3,
+                                                             "bus" : net.bus.name.loc[net.sgen.bus].values,
+                                                             "control" : "PQ"},
+                                                            index=net.sgen.name)))
+
+    d["Generator"] = pd.concat((d["Generator"],pd.DataFrame({"control" : "Slack",
+                                                             "p_set" : 0.,
+                                                             "q_set" : 0.,
+                                                             "bus" : net.bus.name.loc[net.ext_grid.bus].values},
+                                                            index=net.ext_grid.name.fillna("External Grid"))))
+
+    d["Bus"].loc[net.bus.name.loc[net.ext_grid.bus].values,"v_mag_pu_set"] = net.ext_grid.vm_pu.values
+
+    d["Line"] = pd.DataFrame({"type" : net.line.std_type.values,
+                              "bus0" : net.bus.name.loc[net.line.from_bus].values,
+                              "bus1" : net.bus.name.loc[net.line.to_bus].values,
+                              "length" : net.line.length_km.values,
+                              "num_parallel" : net.line.parallel.values},
+                             index=net.line.name)
+
+    d["Transformer"] = pd.DataFrame({"type" : net.trafo.std_type.values,
+                                     "bus0" : net.bus.name.loc[net.trafo.hv_bus].values,
+                                     "bus1" : net.bus.name.loc[net.trafo.lv_bus].values,
+                                     "tap_position" : net.trafo.tp_pos.values},
+                                    index=net.trafo.name)
+
+    for c in ["Bus","Load","Generator","Line","Transformer"]:
+        network.import_components_from_dataframe(d[c],c)
+
+
+
+    #amalgamate buses connected by closed switches
+
+    bus_switches = net.switch[(net.switch.et=="b") & net.switch.closed]
+
+    bus_switches["stays"] = bus_switches.bus.map(net.bus.name)
+    bus_switches["goes"] = bus_switches.element.map(net.bus.name)
+
+    to_replace = pd.Series(bus_switches.stays.values,bus_switches.goes.values)
+
+    for i in to_replace.index:
+        network.remove("Bus",i)
+
+        for c in network.iterate_components({"Load","Generator"}):
+            c.df.bus.replace(to_replace,inplace=True)
+
+        for c in network.iterate_components({"Line","Transformer"}):
+            c.df.bus0.replace(to_replace,inplace=True)
+            c.df.bus1.replace(to_replace,inplace=True)

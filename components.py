@@ -1,6 +1,6 @@
-## Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS), David
-## Schlachtberger (FIAS)
-## Copyright 2017 João Gorenstein Dedecca
+
+
+## Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS)
 
 ## This program is free software; you can redistribute it and/or
 ## modify it under the terms of the GNU General Public License as
@@ -15,8 +15,6 @@
 ## You should have received a copy of the GNU General Public License
 ## along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
-
 """Power system components.
 """
 
@@ -29,15 +27,8 @@ from six.moves import map
 from weakref import ref
 
 
-__author__ = """
-Tom Brown (FIAS), Jonas Hoersch (FIAS), David Schlachtberger (FIAS)
-Joao Gorenstein Dedecca
-"""
-
-__copyright__ = """
-Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS), David Schlachtberger (FIAS), GNU GPL 3
-Copyright 2017 João Gorenstein Dedecca, GNU GPL 3
-"""
+__author__ = "Tom Brown (FIAS), Jonas Hoersch (FIAS), David Schlachtberger (FIAS)"
+__copyright__ = "Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS), David Schlachtberger (FIAS), GNU GPL 3"
 
 import networkx as nx
 
@@ -60,7 +51,7 @@ from .descriptors import Dict
 
 from .io import (export_to_csv_folder, import_from_csv_folder,
                  import_from_pypower_ppc, import_components_from_dataframe,
-                 import_series_from_dataframe)
+                 import_series_from_dataframe, import_from_pandapower_net)
 
 from .pf import (network_lpf, sub_network_lpf, network_pf,
                  sub_network_pf, find_bus_controls, find_slack_bus, calculate_Y,
@@ -152,10 +143,6 @@ class Network(Basic):
     """
 
 
-
-    #the current scenario/time
-    now = "now"
-
     #limit of total co2-tonnes-equivalent emissions for period
     co2_limit = None
 
@@ -170,6 +157,8 @@ class Network(Basic):
     export_to_csv_folder = export_to_csv_folder
 
     import_from_pypower_ppc = import_from_pypower_ppc
+
+    import_from_pandapower_net = import_from_pandapower_net
 
     import_components_from_dataframe = import_components_from_dataframe
 
@@ -202,7 +191,7 @@ class Network(Basic):
         Basic.__init__(self,name)
 
         #a list/index of scenarios/times
-        self.snapshots = pd.Index([self.now])
+        self.snapshots = pd.Index(["now"])
 
         #corresponds to number of hours represented by each snapshot
         self.snapshot_weightings = pd.Series(index=self.snapshots,data=1.)
@@ -217,7 +206,6 @@ class Network(Basic):
         self.components = Dict(components.T.to_dict())
 
         for component in self.components.keys():
-
             file_name = os.path.join(dir_name,
                                      component_attrs_dir_name,
                                      self.components[component]["list_name"] + ".csv")
@@ -362,9 +350,6 @@ class Network(Basic):
 
         #NB: No need to rebind pnl to self, since haven't changed it
 
-        if self.now not in self.snapshots:
-            logger.info("Attribute network.now is not in newly-defined snapshots. (network.now is only relevant if you call e.g. network.pf() without specifying snapshots.)")
-
 
 
     def add(self, class_name, name, **kwargs):
@@ -488,7 +473,7 @@ class Network(Basic):
 
         """
 
-        network = Network(ignore_standard_types=ignore_standard_types)
+        network = self.__class__(ignore_standard_types=ignore_standard_types)
 
         for component in self.iterate_components(["Bus", "Carrier"] + sorted(all_components - {"Bus","Carrier"})):
             df = component.df
@@ -506,13 +491,82 @@ class Network(Basic):
                     pnl[k] = component.pnl[k].copy()
 
         #catch all remaining attributes of network
-        for attr in ["name", "now", "co2_limit", "srid"]:
+        for attr in ["name", "co2_limit", "srid"]:
             setattr(network,attr,getattr(self,attr))
 
         network.snapshot_weightings = self.snapshot_weightings.copy()
 
-
         return network
+
+    def __getitem__(self, key):
+        """
+        Returns a shallow slice of the Network object containing only
+        the selected buses and all the connected components.
+
+        Parameters
+        ----------
+        key : indexer or tuple of indexer
+            If only one indexer is provided it is used in the .ix
+            indexer of the buses dataframe (refer also to the help for
+            pd.DataFrame.ix). If a tuple of two indexers are provided,
+            the first one is used to slice snapshots and the second
+            one buses.
+
+        Returns
+        --------
+        network : pypsa.Network
+
+        Examples
+        --------
+        >>> sub_network_0 = network[network.buses.sub_network = "0"]
+
+        >>> sub_network_0_with_only_10_snapshots = network[:10, network.buses.sub_network = "0"]
+
+        """
+
+        if isinstance(key, tuple):
+            time_i, key = key
+        else:
+            time_i = slice(None)
+
+        n = self.__class__(ignore_standard_types=True)
+        n.import_components_from_dataframe(
+            pd.DataFrame(self.buses.ix[key]).assign(sub_network=""),
+            "Bus"
+        )
+        buses_i = n.buses.index
+
+        rest_components = all_components - one_port_components - branch_components
+        for c in rest_components - {"Bus", "SubNetwork"}:
+            n.import_components_from_dataframe(pd.DataFrame(self.df(c)), c)
+
+        for c in one_port_components:
+            df = self.df(c).loc[lambda df: df.bus.isin(buses_i)]
+            n.import_components_from_dataframe(pd.DataFrame(df), c)
+
+        for c in branch_components:
+            df = self.df(c).loc[lambda df: df.bus0.isin(buses_i) & df.bus1.isin(buses_i)]
+            n.import_components_from_dataframe(pd.DataFrame(df), c)
+
+        n.set_snapshots(self.snapshots[time_i])
+        for c in all_components:
+            i = n.df(c).index
+            try:
+                npnl = n.pnl(c)
+                pnl = self.pnl(c)
+
+                for k in pnl:
+                    npnl[k] = pnl[k].ix[time_i,i.intersection(pnl[k].columns)]
+            except AttributeError:
+                pass
+
+        # catch all remaining attributes of network
+        for attr in ["name", "co2_limit", "srid"]:
+            setattr(n,attr,getattr(self, attr))
+
+        n.snapshot_weightings = self.snapshot_weightings.ix[time_i]
+
+        return n
 
 
     #beware, this turns bools like s_nom_extendable into objects because of
@@ -582,7 +636,7 @@ class Network(Basic):
 
     def determine_full_network_topology(self):
         """
-        Build sub_networks from topology with all branches (lines and links).
+        Build sub_networks from topology.
         """
 
         adjacency_matrix = self.adjacency_matrix()
@@ -631,32 +685,37 @@ class Network(Basic):
 
 
         for c in self.iterate_components(one_port_components):
-            missing = c.df.index[pd.isnull(c.df.bus.map(self.buses.v_nom))]
+            missing = c.df.index[~c.df.bus.isin(self.buses.index)]
             if len(missing) > 0:
-                logger.warning("The following {} have buses which are not defined:\n{}".format(c.list_name,missing))
+                logger.warning("The following %s have buses which are not defined:\n%s",
+                               c.list_name, missing)
 
         for c in self.iterate_components(branch_components):
-            for end in ["0","1"]:
-                missing = c.df.index[pd.isnull(c.df["bus"+end].map(self.buses.v_nom))]
+            for attr in ["bus0","bus1"]:
+                missing = c.df.index[~c.df[attr].isin(self.buses.index)]
                 if len(missing) > 0:
-                    logger.warning("The following {} have bus {} which are not defined:\n{}".format(c.list_name,end,missing))
+                    logger.warning("The following %s have %s which are not defined:\n%s",
+                                   c.list_name, attr, missing)
 
 
         for c in self.iterate_components(passive_branch_components):
             for attr in ["x","r"]:
                 bad = c.df.index[c.df[attr] == 0.]
                 if len(bad) > 0:
-                    logger.warning("The following {} have zero {}, which could break the linear load flow:\n{}".format(c.list_name,attr,bad))
+                    logger.warning("The following %s have zero %s, which could break the linear load flow:\n%s",
+                                   c.list_name, attr, bad)
 
             bad = c.df.index[(c.df["x"] == 0.) & (c.df["r"] == 0.)]
             if len(bad) > 0:
-                logger.warning("The following {} have zero series impedance, which will break the load flow:\n{}".format(c.list_name,bad))
+                logger.warning("The following %s have zero series impedance, which will break the load flow:\n%s",
+                               c.list_name, bad)
 
 
         for c in self.iterate_components({"Transformer"}):
             bad = c.df.index[c.df["s_nom"] == 0.]
             if len(bad) > 0:
-                logger.warning("The following {} have zero s_nom, which is used to define the impedance and will thus break the load flow:\n{}".format(c.list_name,bad))
+                logger.warning("The following %s have zero s_nom, which is used to define the impedance and will thus break the load flow:\n%s",
+                               c.list_name, bad)
 
 
         for c in self.iterate_components(all_components):
@@ -665,16 +724,70 @@ class Network(Basic):
 
                 diff = attr_df.columns.difference(c.df.index)
                 if len(diff) > 0:
-                    logger.warning("The following {} have time series defined for attribute {} in network.{}_t, but are not defined in network.{}:\n{}".format(c.list_name,attr,c.list_name,c.list_name,diff))
+                    logger.warning("The following %s have time series defined for attribute %s in network.%s_t, but are not defined in network.%s:\n%s",
+                                   c.list_name, attr, c.list_name, c.list_name, diff)
 
                 diff = self.snapshots.difference(attr_df.index)
                 if len(diff) > 0:
-                    logger.warning("In the time-dependent Dataframe for attribute {} of network.{}_t the following snapshots are missing:\n{}".format(attr,c.list_name,diff))
+                    logger.warning("In the time-dependent Dataframe for attribute %s of network.%s_t the following snapshots are missing:\n%s",
+                                   attr, c.list_name, diff)
 
                 diff = attr_df.index.difference(self.snapshots)
                 if len(diff) > 0:
-                    logger.warning("In the time-dependent Dataframe for attribute {} of network.{}_t the following snapshots are defined which are not in network.snapshots:\n{}".format(attr,c.list_name,diff))
+                    logger.warning("In the time-dependent Dataframe for attribute %s of network.%s_t the following snapshots are defined which are not in network.snapshots:\n%s",
+                                   attr, c.list_name, diff)
 
+
+
+        #check all dtypes of component attributes
+
+        #this isn't strictly necessary (except for str)
+        #since e.g. float == np.dtype("float64") is True
+        #but we do it for easy reading of errors
+        np_dtypes = {str : np.dtype("object"),
+                     float : np.dtype("float64"),
+                     int : np.dtype("int64"),
+                     bool : np.dtype("bool")}
+
+        for c in self.iterate_components():
+
+            #first check static attributes
+
+            types_soll = c.attrs["typ"][c.attrs["static"]].drop("name")
+
+            dtypes_soll = types_soll.replace(np_dtypes)
+
+            unmatched = (c.df.dtypes[dtypes_soll.index] != dtypes_soll)
+
+            if unmatched.any():
+                logger.warning("The following attributes of the dataframe %s have the wrong dtype:\n%s\n"
+                               "They are:\n%s\n"
+                               "but should be:\n%s",
+                               c.list_name,
+                               unmatched.index[unmatched],
+                               c.df.dtypes[dtypes_soll.index[unmatched]],
+                               dtypes_soll[unmatched])
+
+            #now check varying attributes
+
+            types_soll = c.attrs["typ"][c.attrs["varying"]]
+
+            dtypes_soll = types_soll.replace(np_dtypes)
+
+            for attr, typ in dtypes_soll.iteritems():
+                if c.pnl[attr].empty:
+                    continue
+
+                unmatched = (c.pnl[attr].dtypes != typ)
+
+                if unmatched.any():
+                    logger.warning("The following columns of time-varying attribute %s in %s_t have the wrong dtype:\n%s\n"
+                                   "They are:\n%s\n"
+                                   "but should be:\n%s",
+                                   attr,c.list_name,
+                                   unmatched.index[unmatched],
+                                   c.pnl[attr].dtypes[unmatched],
+                                   typ)
 
 
 
@@ -771,7 +884,7 @@ class SubNetwork(Common):
     def iterate_components(self, components=None, skip_empty=True):
         for c in self.network.iterate_components(components=components, skip_empty=False):
             c = Component(*c[:-1], ind=getattr(self, c.list_name + '_i')())
-            if not (skip_empty and c.df.empty):
+            if not (skip_empty and len(c.ind) == 0):
                 yield c
 
 

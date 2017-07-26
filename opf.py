@@ -1,3 +1,5 @@
+
+
 ## Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS), David
 ## Schlachtberger (FIAS)
 ## Copyright 2017 João Gorenstein Dedecca
@@ -35,15 +37,13 @@ Copyright 2017 João Gorenstein Dedecca, GNU GPL 3
 """
 
 import pandas as pd
+import numpy as np
 from scipy.sparse.linalg import spsolve
 from pyomo.environ import (ConcreteModel, Var, Objective,
                            NonNegativeReals, Constraint, Reals,
-                           Suffix, Expression, Boolean, Param, NonNegativeReals, value)
+                           Suffix, Expression, Boolean, Param, NonNegativeReals, value, Binary)
 from pyomo.opt import SolverFactory
-from pyomo.core.base.block import generate_cuid_names
 from itertools import chain
-import os,sys,psutil, gc
-import networkx as nx
 import logging
 logger = logging.getLogger(__name__)
 
@@ -54,15 +54,9 @@ try:
 except ValueError:
     _pd_version = LooseVersion(pd.__version__)
 
-import pyomo
-try:
-    _pyomo_version = StrictVersion(pyomo.version.version)
-except ValueError:
-    _pyomo_version = LooseVersion(pyomo.version.version)
-
 from .pf import (calculate_dependent_values, find_slack_bus,
                  find_bus_controls, calculate_B_H, calculate_PTDF, find_tree,
-                 find_cycles)
+                 find_cycles, _as_snapshots)
 from .opt import (l_constraint, l_objective, LExpression, LConstraint,
                   patch_optsolver_free_model_before_solving,
                   patch_optsolver_record_memusage_before_solving,
@@ -72,7 +66,9 @@ from .descriptors import get_switchable_as_dense, allocate_series_dataframes
 #Custom imports
 import time, datetime, operator
 from copy import deepcopy
-import numpy as np
+import os,sys,psutil, gc
+import networkx as nx
+import pyomo
 
 def network_opf(network,snapshots=None):
     """Optimal power flow for snapshots."""
@@ -84,7 +80,11 @@ def network_opf(network,snapshots=None):
 def define_generator_variables_constraints(network,snapshots):
 
     extendable_gens_i = network.generators.index[network.generators.p_nom_extendable]
-    fixed_gens_i = network.generators.index[~ network.generators.p_nom_extendable]
+    fixed_gens_i = network.generators.index[~network.generators.p_nom_extendable & ~network.generators.committable]
+    fixed_committable_gens_i = network.generators.index[~network.generators.p_nom_extendable & network.generators.committable]
+
+    if (network.generators.p_nom_extendable & network.generators.committable).any():
+        logger.warning("The following generators have both investment optimisation and unit commitment:\n{}\nCurrently PyPSA cannot do both these functions, so PyPSA is choosing investment optimisation for these generators.".format(network.generators.index[network.generators.p_nom_extendable & network.generators.committable]))
 
     p_min_pu = get_switchable_as_dense(network, 'Generator', 'p_min_pu')
     p_max_pu = get_switchable_as_dense(network, 'Generator', 'p_max_pu')
@@ -92,7 +92,7 @@ def define_generator_variables_constraints(network,snapshots):
     ## Define generator dispatch variables ##
 
     gen_p_bounds = {(gen,sn) : (None,None)
-                    for gen in extendable_gens_i
+                    for gen in extendable_gens_i | fixed_committable_gens_i
                     for sn in snapshots}
 
     if len(fixed_gens_i):
@@ -140,6 +140,183 @@ def define_generator_variables_constraints(network,snapshots):
                    for gen in extendable_gens_i for sn in snapshots}
     l_constraint(network.model, "generator_p_upper", gen_p_upper,
                  list(extendable_gens_i), snapshots)
+
+
+
+    ## Define committable generator statuses ##
+
+    network.model.generator_status = Var(list(fixed_committable_gens_i), snapshots,
+                                         within=Binary)
+
+    var_lower = p_min_pu.loc[:,fixed_committable_gens_i].multiply(network.generators.loc[fixed_committable_gens_i, 'p_nom'])
+    var_upper = p_max_pu.loc[:,fixed_committable_gens_i].multiply(network.generators.loc[fixed_committable_gens_i, 'p_nom'])
+
+
+    committable_gen_p_lower = {(gen,sn) : LConstraint(LExpression([(var_lower[gen][sn],network.model.generator_status[gen,sn]),(-1.,network.model.generator_p[gen,sn])]),"<=") for gen in fixed_committable_gens_i for sn in snapshots}
+
+    l_constraint(network.model, "committable_gen_p_lower", committable_gen_p_lower,
+                 list(fixed_committable_gens_i), snapshots)
+
+
+    committable_gen_p_upper = {(gen,sn) : LConstraint(LExpression([(var_upper[gen][sn],network.model.generator_status[gen,sn]),(-1.,network.model.generator_p[gen,sn])]),">=") for gen in fixed_committable_gens_i for sn in snapshots}
+
+    l_constraint(network.model, "committable_gen_p_upper", committable_gen_p_upper,
+                 list(fixed_committable_gens_i), snapshots)
+
+
+    ## Deal with minimum up time ##
+
+    up_time_gens = fixed_committable_gens_i[network.generators.loc[fixed_committable_gens_i,"min_up_time"] > 0]
+
+    for gen_i, gen in enumerate(up_time_gens):
+
+        min_up_time = network.generators.loc[gen,"min_up_time"]
+        initial_status = network.generators.loc[gen,"initial_status"]
+
+        blocks = max(1,len(snapshots)-min_up_time+1)
+
+        gen_up_time = {}
+
+        for i in range(blocks):
+            lhs = LExpression([(1,network.model.generator_status[gen,snapshots[j]]) for j in range(i,i+min_up_time)])
+
+            if i == 0:
+                rhs = LExpression([(min_up_time,network.model.generator_status[gen,snapshots[i]])],-min_up_time*initial_status)
+            else:
+                rhs = LExpression([(min_up_time,network.model.generator_status[gen,snapshots[i]]),(-min_up_time,network.model.generator_status[gen,snapshots[i-1]])])
+
+            gen_up_time[i] = LConstraint(lhs,">=",rhs)
+
+        l_constraint(network.model, "gen_up_time_{}".format(gen_i), gen_up_time,
+                     range(blocks))
+
+
+
+    ## Deal with minimum down time ##
+
+    down_time_gens = fixed_committable_gens_i[network.generators.loc[fixed_committable_gens_i,"min_down_time"] > 0]
+
+    for gen_i, gen in enumerate(down_time_gens):
+
+        min_down_time = network.generators.loc[gen,"min_down_time"]
+        initial_status = network.generators.loc[gen,"initial_status"]
+
+        blocks = max(1,len(snapshots)-min_down_time+1)
+
+        gen_down_time = {}
+
+        for i in range(blocks):
+            #sum of 1-status
+            lhs = LExpression([(-1,network.model.generator_status[gen,snapshots[j]]) for j in range(i,i+min_down_time)],min_down_time)
+
+            if i == 0:
+                rhs = LExpression([(-min_down_time,network.model.generator_status[gen,snapshots[i]])],min_down_time*initial_status)
+            else:
+                rhs = LExpression([(-min_down_time,network.model.generator_status[gen,snapshots[i]]),(min_down_time,network.model.generator_status[gen,snapshots[i-1]])])
+
+            gen_down_time[i] = LConstraint(lhs,">=",rhs)
+
+        l_constraint(network.model, "gen_down_time_{}".format(gen_i), gen_down_time,
+                     range(blocks))
+
+    ## Deal with start up costs ##
+
+    suc_gens = fixed_committable_gens_i[network.generators.loc[fixed_committable_gens_i,"start_up_cost"] > 0]
+
+    network.model.generator_start_up_cost = Var(list(suc_gens),snapshots,
+                                                domain=NonNegativeReals)
+
+    sucs = {}
+
+    for gen in suc_gens:
+        suc = network.generators.loc[gen,"start_up_cost"]
+        initial_status = network.generators.loc[gen,"initial_status"]
+
+        for i,sn in enumerate(snapshots):
+
+            if i == 0:
+                rhs = LExpression([(suc, network.model.generator_status[gen,sn])],-suc*initial_status)
+            else:
+                rhs = LExpression([(suc, network.model.generator_status[gen,sn]),(-suc,network.model.generator_status[gen,snapshots[i-1]])])
+
+            lhs = LExpression([(1,network.model.generator_start_up_cost[gen,sn])])
+
+            sucs[gen,sn] = LConstraint(lhs,">=",rhs)
+
+    l_constraint(network.model, "generator_start_up", sucs, list(suc_gens), snapshots)
+
+
+
+    ## Deal with shut down costs ##
+
+    sdc_gens = fixed_committable_gens_i[network.generators.loc[fixed_committable_gens_i,"shut_down_cost"] > 0]
+
+    network.model.generator_shut_down_cost = Var(list(sdc_gens),snapshots,
+                                                domain=NonNegativeReals)
+
+    sdcs = {}
+
+    for gen in sdc_gens:
+        sdc = network.generators.loc[gen,"shut_down_cost"]
+        initial_status = network.generators.loc[gen,"initial_status"]
+
+        for i,sn in enumerate(snapshots):
+
+            if i == 0:
+                rhs = LExpression([(-sdc, network.model.generator_status[gen,sn])],sdc*initial_status)
+            else:
+                rhs = LExpression([(-sdc, network.model.generator_status[gen,sn]),(sdc,network.model.generator_status[gen,snapshots[i-1]])])
+
+            lhs = LExpression([(1,network.model.generator_shut_down_cost[gen,sn])])
+
+            sdcs[gen,sn] = LConstraint(lhs,">=",rhs)
+
+    l_constraint(network.model, "generator_shut_down", sdcs, list(sdc_gens), snapshots)
+
+
+
+    ## Deal with ramp limits without unit commitment ##
+
+    sns = snapshots[1:]
+
+    ru_gens = network.generators.index[~network.generators.ramp_limit_up.isnull()]
+
+    ru = {}
+
+    for gen in ru_gens:
+        for i,sn in enumerate(sns):
+            if network.generators.at[gen, "p_nom_extendable"]:
+                lhs = LExpression([(1, network.model.generator_p[gen,sn]), (-1, network.model.generator_p[gen,snapshots[i]]), (-network.generators.at[gen, "ramp_limit_up"], network.model.generator_p_nom[gen])])
+            elif not network.generators.at[gen, "committable"]:
+                lhs = LExpression([(1, network.model.generator_p[gen,sn]), (-1, network.model.generator_p[gen,snapshots[i]])], -network.generators.at[gen, "ramp_limit_up"]*network.generators.at[gen, "p_nom"])
+            else:
+                lhs = LExpression([(1, network.model.generator_p[gen,sn]), (-1, network.model.generator_p[gen,snapshots[i]]), ((network.generators.at[gen, "ramp_limit_start_up"] - network.generators.at[gen, "ramp_limit_up"])*network.generators.at[gen, "p_nom"], network.model.generator_status[gen,snapshots[i]]), (-network.generators.at[gen, "ramp_limit_start_up"]*network.generators.at[gen, "p_nom"], network.model.generator_status[gen,sn])])
+
+            ru[gen,sn] = LConstraint(lhs,"<=")
+
+    l_constraint(network.model, "ramp_up", ru, list(ru_gens), sns)
+
+
+
+    rd_gens = network.generators.index[~network.generators.ramp_limit_down.isnull()]
+
+    rd = {}
+
+
+    for gen in rd_gens:
+        for i,sn in enumerate(sns):
+            if network.generators.at[gen, "p_nom_extendable"]:
+                lhs = LExpression([(1, network.model.generator_p[gen,sn]), (-1, network.model.generator_p[gen,snapshots[i]]), (network.generators.at[gen, "ramp_limit_down"], network.model.generator_p_nom[gen])])
+            elif not network.generators.at[gen, "committable"]:
+                lhs = LExpression([(1, network.model.generator_p[gen,sn]), (-1, network.model.generator_p[gen,snapshots[i]])], network.generators.loc[gen, "ramp_limit_down"]*network.generators.at[gen, "p_nom"])
+            else:
+                lhs = LExpression([(1, network.model.generator_p[gen,sn]), (-1, network.model.generator_p[gen,snapshots[i]]), ((network.generators.at[gen, "ramp_limit_down"] - network.generators.at[gen, "ramp_limit_shut_down"])*network.generators.at[gen, "p_nom"], network.model.generator_status[gen,sn]), (network.generators.at[gen, "ramp_limit_shut_down"]*network.generators.at[gen, "p_nom"], network.model.generator_status[gen,snapshots[i]])])
+
+            rd[gen,sn] = LConstraint(lhs,">=")
+
+    l_constraint(network.model, "ramp_down", rd, list(rd_gens), sns)
+
+
 
 
 
@@ -230,7 +407,7 @@ def define_storage_variables_constraints(network,snapshots,OGEM_options):
     ## Now define state of charge constraints ##
 
     network.model.state_of_charge = Var(list(network.storage_units.index), snapshots,
-                                            domain=NonNegativeReals, bounds=(0,None))
+                                        domain=NonNegativeReals, bounds=(0,None))
 
     if OGEM_options["reference"] != "expansion":
         upper = {(su,sn) : [[(1,model.state_of_charge[su,sn]),
@@ -402,7 +579,7 @@ def define_energy_constraints(network, snapshots):
 
     l_constraint(network.model, "energy_constraint", _energy_constraint, list(inflow_generators.index))
 
-def define_branch_extension_variables(network, snapshots):
+def define_branch_extension_variables(network,snapshots):
     """ Creates the investment ratio and binary investment variables for branches.
         e.g. the transmission capacity of a passive branch is pb_inv_ratio * s_nom_max, with pb_inv_ratio <= pb_bin_inv and pb_bin_inv a binary variable.
         Converters investment uses continuous variables.
@@ -441,7 +618,7 @@ def define_branch_extension_variables(network, snapshots):
     network.model.conv_p_nom = Var(list(extendable_converters_i),
                                    domain=NonNegativeReals, bounds=conv_p_nom_bounds)
 
-def define_link_flows(network, snapshots):
+def define_link_flows(network,snapshots):
     """ Flows for extendable integer branches is limited by the investment ratio x maximum nominal capacity.
         AC/DC converters are modelled as conventional continuous-investment links.
     """
@@ -524,6 +701,7 @@ def define_passive_branch_flows_with_angles(network, snapshots):
     extendable_branches_i = passive_branches.index[passive_branches.s_nom_extendable]
     fixed_branches_i = passive_branches.index[~ passive_branches.s_nom_extendable]
     network.model.passive_branch_p = Var(list(passive_branches.index), snapshots)
+
     flows = {}
     for branch in fixed_branches_i:
         bus0 = passive_branches.bus0[branch]
@@ -717,30 +895,31 @@ def define_nodal_balances(network,snapshots):
 
 
     for gen in network.generators.index:
-        bus = network.generators.bus[gen]
-        sign = network.generators.sign[gen]
+        bus = network.generators.at[gen,"bus"]
+        sign = network.generators.at[gen,"sign"]
         for sn in snapshots:
             network._p_balance[bus,sn].variables.append((sign,network.model.generator_p[gen,sn]))
 
     load_p_set = get_switchable_as_dense(network, 'Load', 'p_set')
     for load in network.loads.index:
-        bus = network.loads.bus[load]
-        sign = network.loads.sign[load]
+        bus = network.loads.at[load,"bus"]
+        sign = network.loads.at[load,"sign"]
         for sn in snapshots:
             network._p_balance[bus,sn].constant += sign*load_p_set.at[sn,load]
 
     for su in network.storage_units.index:
-        bus = network.storage_units.bus[su]
-        sign = network.storage_units.sign[su]
+        bus = network.storage_units.at[su,"bus"]
+        sign = network.storage_units.at[su,"sign"]
         for sn in snapshots:
             network._p_balance[bus,sn].variables.append((sign,network.model.storage_p_dispatch[su,sn]))
             network._p_balance[bus,sn].variables.append((-sign,network.model.storage_p_store[su,sn]))
 
     for store in network.stores.index:
-        bus = network.stores.bus[store]
-        sign = network.stores.sign[store]
+        bus = network.stores.at[store,"bus"]
+        sign = network.stores.at[store,"sign"]
         for sn in snapshots:
             network._p_balance[bus,sn].variables.append((sign,network.model.store_p[store,sn]))
+
 
 def define_nodal_balance_constraints(network,snapshots):
 
@@ -748,8 +927,8 @@ def define_nodal_balance_constraints(network,snapshots):
 
 
     for branch in passive_branches.index:
-        bus0 = passive_branches.bus0[branch]
-        bus1 = passive_branches.bus1[branch]
+        bus0 = passive_branches.at[branch,"bus0"]
+        bus1 = passive_branches.at[branch,"bus1"]
         bt = branch[0]
         bn = branch[1]
         for sn in snapshots:
@@ -876,19 +1055,23 @@ def define_objective(network, snapshots, low_totex_factor, high_totex_factor):
     model = network.model
 
     extendable_generators = network.generators[network.generators.p_nom_extendable]
+
     ext_sus = network.storage_units[network.storage_units.p_nom_extendable]
+
     ext_stores = network.stores[network.stores.e_nom_extendable]
+
     passive_branches = network.passive_branches()
+
     extendable_passive_branches = passive_branches[passive_branches.s_nom_extendable]
+
     extendable_ptp_links = network.links[network.links.p_nom_extendable & (network.links.branch_type == "ptp")]
+
     extendable_converters = network.links[network.links.p_nom_extendable & (network.links.branch_type == "converter")]
 
     # The capitals cost of extendable generators is a Pyomo parameter.
     # Allows to set them to zero when fixing and re-running the MIP to obtain short-run instead of long-run marginal prices.
     # def gen_capital_cost_rule(model,gen):
     #     return extendable_generators.at[gen,"capital_cost"]
-
-    #model.gen_capital_cost = Param(list(extendable_generators.index), initialize=gen_capital_cost_rule,mutable=True)
 
     objective = LExpression()
 
@@ -960,14 +1143,6 @@ def define_objective(network, snapshots, low_totex_factor, high_totex_factor):
     l_expression(model,investment_objective)
     
     #TODO include storage capital costs if there is endogenous storage investment
-    # Create generator investment cost expression, add to objective and replace old objective.
-    #model.comp_obj = Expression(expr=sum(model.gen_capital_cost[gen] * high_totex_factor * model.generator_p_nom[gen]
-    #                                     for gen in extendable_generators.index))
-    #model.new_obj = (model.objective.expr + model.comp_obj.expr)
-    #model.del_component("objective")
-    #model.objective = Objective(expr = model.new_obj)
-    #model.del_component("new_obj")
-    #model.del_component("comp_obj")
 
 def define_absolute_flows(network, snapshots):
     """ Create variables of absolute flows of branches.
@@ -1316,9 +1491,6 @@ def extract_optimisation_results(network, snapshots,reference,formulation="angle
                         as_series(model.storage_p_dispatch)
                         - as_series(model.storage_p_store))
 
-        as_series(model.storage_p_dispatch).to_csv('storage_p_dispatch.csv')
-        as_series(model.storage_p_store).to_csv('storage_p_store.csv')
-
         set_from_series(network.storage_units_t.state_of_charge,
                         as_series(model.state_of_charge))
 
@@ -1375,6 +1547,7 @@ def extract_optimisation_results(network, snapshots,reference,formulation="angle
                             pd.Series(list(model.power_balance.values()),
                                       index=pd.MultiIndex.from_tuples(list(model.power_balance.keys())))
                             .map(pd.Series(list(model.dual.values()), index=pd.Index(list(model.dual.keys())))))
+
         if formulation == "angles":
             set_from_series(network.buses_t.v_ang,
                             as_series(model.voltage_angles))
@@ -1438,7 +1611,24 @@ def extract_optimisation_results(network, snapshots,reference,formulation="angle
         except (AttributeError, KeyError) as e:
             logger.warning("Could not read out co2_price, although a co2_limit was set")
 
-def network_lopf(network, snapshots=None, solver_name="glpk",
+    #extract unit commitment statuses
+    if network.generators.committable.any():
+        allocate_series_dataframes(network, {'Generator': ['status']})
+
+        fixed_committable_gens_i = network.generators.index[~network.generators.p_nom_extendable & network.generators.committable]
+
+        if len(fixed_committable_gens_i) > 0:
+            network.generators_t.status.loc[snapshots,fixed_committable_gens_i] = \
+                as_series(model.generator_status).unstack(0)
+
+
+def memory_usage(step):
+
+    gc.collect()
+    process = psutil.Process(os.getpid())
+    print('{:s} memory usage: {:.2f}'.format(step,process.memory_info().rss / float(2 ** 20)))
+
+def network_lopf(network, snapshots=None, solver_name="glpk", solver_io=None,
                  skip_pre=False, extra_functionality=None, solver_options={},
                  keep_files=False, formulation="angles", ptdf_tolerance=0.,
                  free_memory={}, OGEM_options=None, base_welfare=None,parameters=None):
@@ -1449,10 +1639,13 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
     ----------
     snapshots : list or index slice
         A list of snapshots to optimise, must be a subset of
-        network.snapshots, defaults to network.now
+        network.snapshots, defaults to network.snapshots
     solver_name : string
         Must be a solver name that pyomo recognises and that is
         installed, e.g. "glpk", "gurobi"
+    solver_io : string, default None
+        Solver Input-Output option, e.g. "python" to use "gurobipy" for
+        solver_name="gurobi"
     skip_pre: bool, default False
         Skip the preliminary steps of computing topology, calculating
         dependent values and finding bus controls.
@@ -1488,14 +1681,21 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
     None
     """
 
+    memory_usage('Start')
     print("MILP OPF build at {:%H:%M}...".format(datetime.datetime.now()))
 
     # Variables declaration
-    warmstart = False # Warmstart is sometimes used for integer expansions.
+    warmstart = False
+
+    # The snapshot scale may improve the numerical properties of the problem. Default = 1.
+    if OGEM_options["reference"] != "expansion":
+        snapshot_scale = parameters['MILP_snapshot_scale']
+    else:
+        snapshot_scale = parameters['snapshot_scale']
 
     # The low and high totex factor transform the CAPEX and OPEX (maintenance) costs to hourly values
-    low_totex_factor = (np.pmt(parameters["discount_rate"], parameters["high_lifetime"], -1.) + parameters['low_OPEX_%']) / 8760 # Factor to calculate investment hourly payments for transmission.
-    high_totex_factor = (np.pmt(parameters["discount_rate"], parameters["low_lifetime"], -1.) + parameters['high_OPEX_%']) / 8760 # Factor to calculate investment hourly payments for generation.
+    low_totex_factor = (np.pmt(parameters["discount_rate"], parameters["high_lifetime"], -1.) + parameters['low_OPEX_%']) / 8760 * snapshot_scale # Factor to calculate investment hourly payments for transmission.
+    high_totex_factor = (np.pmt(parameters["discount_rate"], parameters["low_lifetime"], -1.) + parameters['high_OPEX_%']) / 8760 * snapshot_scale # Factor to calculate investment hourly payments for generation.
 
     if not skip_pre:
         network.determine_network_topology()
@@ -1504,8 +1704,8 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
             find_slack_bus(sub_network)
         logger.info("Performed preliminary steps")
 
-    if snapshots is None:
-        snapshots = [network.now]
+
+    snapshots = _as_snapshots(network, snapshots)
 
     logger.info("Building pyomo model using `%s` formulation", formulation)
     network.model = ConcreteModel("Mixed Integer Optimal Investment & Operation")
@@ -1520,15 +1720,15 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
 
     define_store_variables_constraints(network,snapshots)
 
-    define_branch_extension_variables(network, snapshots)
+    define_branch_extension_variables(network,snapshots)
 
-    define_link_flows(network, snapshots)
+    define_link_flows(network,snapshots)
 
     define_nodal_balances(network,snapshots)
 
     define_passive_branch_flows(network,snapshots,formulation,ptdf_tolerance)
 
-    define_passive_branch_constraints(network, snapshots)
+    define_passive_branch_constraints(network,snapshots)
 
     define_controllable_branch_constraints(network, snapshots) # New constraint to limit force investment ratio to 0 when line is not invested in
 
@@ -1558,12 +1758,10 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
             define_cooperation_constraint(network,OGEM_options["cooperation_limit"]) # Add cooperation constraint if there is a cooperation limit
 
     #tidy up auxilliary expressions
-
     del network._p_balance
 
     logger.info("Solving model using %s", solver_name)
-
-    opt = SolverFactory(solver_name) #
+    opt = SolverFactory(solver_name, solver_io=solver_io)
 
     patch_optsolver_record_memusage_before_solving(opt, network)
 
@@ -1596,19 +1794,35 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
         for epb in extendable_passive_branches_i:
             network.model.pb_bin_inv[epb].fixed = status
             network.model.pb_inv_ratio[epb].fixed = status
+            # Slightly increase transfer capacities to eliminate congestion and harmonize marginal prices.
+            if False:
+                if status:
+                    if network.model.pb_bin_inv[epb].value == 1:
+                        network.model.pb_inv_ratio[epb].value = min(network.model.pb_inv_ratio[epb].value * (1 + transfer_increase), 1.0)
 
         for ecb in network.links.index[network.links.p_nom_extendable & (network.links.branch_type == "ptp")]:
             network.model.cb_bin_inv[ecb].fixed = status
             network.model.cb_inv_ratio[ecb].fixed = status
+            # Slightly increase transfer capacities to eliminate congestion and harmonize marginal prices.
+            if False:
+                if status:
+                    if network.model.cb_bin_inv[ecb].value == 1:
+                        network.model.cb_inv_ratio[ecb].value = min(network.model.cb_inv_ratio[ecb].value * (1 + transfer_increase), 1.0)
 
         for ecb in network.links.index[network.links.p_nom_extendable & (network.links.branch_type == "ptp")]:
             network.model.cb_bin_inv[ecb].fixed = status
             network.model.cb_inv_ratio[ecb].fixed = status
+            # Slightly increase transfer capacities to eliminate congestion and harmonize marginal prices.
+            if False:
+                if status:
+                    if network.model.cb_bin_inv[ecb].value == 1:
+                        network.model.cb_inv_ratio[ecb].value = min(network.model.cb_inv_ratio[ecb].value * (1 + transfer_increase), 1.0)
 
         # Fix all extendable generators to fix solution.
         for gen in network.generators[network.generators.p_nom_extendable].index:
             # WARNING Disabling fixing of generators affects marginal costs
             network.model.generator_p_nom[gen].fixed = status
+            #network.model.gen_capital_cost[gen] = network.generators.loc[gen, "capital_cost"] * (not status)
 
         # country_participation is integer and needs to be fixed.
         if hasattr(network.model, "country_participation"):
@@ -1684,11 +1898,15 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
     def solver_run(keepfiles=keep_files, symbolic = symbolic_labels):
         """ Solver run function since solver is called multiple times """
 
+        memory_usage('Pre-solver')
+        print(solver_options)
+
         if 'pypsa' in free_memory:
             with empty_network(network):
                 network.results = opt.solve(network.model, suffixes=["dual"],keepfiles=keepfiles, options=solver_options, warmstart=warmstart,tee=True,symbolic_solver_labels = symbolic)
         else:
             network.results = opt.solve(network.model, suffixes=["dual"],keepfiles=keepfiles, options=solver_options, warmstart=warmstart,tee=True,symbolic_solver_labels = symbolic)
+        memory_usage('Post-solver')
 
         print("Solver finished at {:%H:%M}.".format(datetime.datetime.now()))
 
@@ -1886,7 +2104,7 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
                 participation = network.model.country_participation[country].value
                 network.model.country_participation[country].value = 1.
                 update_expressions(country)
-                network.model.welfare_big_M[country] = max(- network.model.pareto_welfare[country].lslack() * 1.2 * network.model.welfare_big_M_scale.value, 1.5e2) # Update the minimum big_M value in case the big_M_duals_check fails.
+                network.model.welfare_big_M[country] = max(- network.model.pareto_welfare[country].lslack() * 1.2 * network.model.welfare_big_M_scale.value, 1.5e2) * parameters['MILP_snapshot_scale'] # Update the minimum big_M value in case the big_M_duals_check fails.
                 network.model.country_participation[country].value = participation
                 update_expressions(country)
 
@@ -1915,6 +2133,8 @@ def network_lopf(network, snapshots=None, solver_name="glpk",
                 min_gen_margin = sum([abs(network.model.gen_margins[m].value) for m in network.model.gen_margins]) / len(network.model.gen_margins) * margin_threshold / 2
 
                 for sn in snapshots:
+                    #for gen, (mc, bus) in network.generators[['marginal_cost', 'bus']].iterrows():
+                    #    network.model.gen_margins[(gen, sn)] = network.model.gen_margins[(gen,sn)].value * (abs(network.model.gen_margins[(gen,sn)].value) > min_gen_margin)
                     for pb,(bus0,bus1) in network.lines[['bus0','bus1']].iterrows():
                         network.model.pb_margins[(pb, sn)] = network.model.pb_margins[(pb, sn)].value * (abs(network.model.pb_margins[(pb, sn)].value) > min_pb_margin)
                     for cb,(bus0,bus1) in network.links[['bus0','bus1']].iterrows():
